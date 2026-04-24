@@ -1,0 +1,187 @@
+import argparse
+import csv
+import re
+import time
+from dataclasses import dataclass
+from typing import Iterable
+from urllib.parse import urljoin, urlparse
+
+import requests
+from bs4 import BeautifulSoup
+
+
+BASE_URL = "https://edumap.az/vakansiyalar"
+DATE_REGEX = re.compile(
+    r"\d{1,2}\s+[A-Za-zƏəĞğİıÖöŞşÜüÇç]+,\s+\d{4}\s*-\s*\d{1,2}:\d{2}"
+)
+
+
+@dataclass
+class Vacancy:
+    page: int
+    title: str
+    url: str
+    published_at: str
+
+
+def looks_like_vacancy_url(url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.netloc and parsed.netloc != "edumap.az":
+        return False
+    path = parsed.path.rstrip("/")
+    if not path or path in ("/vakansiyalar", "/"):
+        return False
+    return True
+
+
+def extract_page_vacancies(html: str, page_no: int) -> list[Vacancy]:
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[Vacancy] = []
+
+    for card in soup.select("article, .post, .news-item, .card, .vacancy-item"):
+        link = card.find("a", href=True)
+        if not link:
+            continue
+        href = urljoin("https://edumap.az", link["href"])
+        if not looks_like_vacancy_url(href):
+            continue
+        title = link.get_text(" ", strip=True)
+        if not title:
+            heading = card.find(["h1", "h2", "h3", "h4"])
+            title = heading.get_text(" ", strip=True) if heading else ""
+        if not title:
+            continue
+        text = card.get_text(" ", strip=True)
+        date_match = DATE_REGEX.search(text)
+        published = date_match.group(0) if date_match else ""
+        results.append(Vacancy(page_no, title, href, published))
+
+    if results:
+        return results
+
+    for heading in soup.find_all(["h2", "h3"]):
+        link = heading.find("a", href=True)
+        if not link:
+            continue
+        href = urljoin("https://edumap.az", link["href"])
+        if not looks_like_vacancy_url(href):
+            continue
+        title = heading.get_text(" ", strip=True)
+        block_text = " ".join(
+            x.get_text(" ", strip=True) for x in heading.find_all_previous(limit=2)
+        ) + " " + " ".join(
+            x.get_text(" ", strip=True) for x in heading.find_all_next(limit=2)
+        )
+        date_match = DATE_REGEX.search(block_text)
+        published = date_match.group(0) if date_match else ""
+        results.append(Vacancy(page_no, title, href, published))
+
+    return results
+
+
+def scrape_all_pages(
+    start_page: int = 1,
+    max_pages: int = 500,
+    sleep_seconds: float = 0.2,
+    timeout: int = 30,
+) -> list[Vacancy]:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        }
+    )
+
+    all_rows: list[Vacancy] = []
+    seen_urls: set[str] = set()
+    empty_streak = 0
+
+    for page in range(start_page, max_pages + 1):
+        url = BASE_URL if page == 1 else f"{BASE_URL}?page={page}"
+        resp = session.get(url, timeout=timeout)
+        if resp.status_code != 200:
+            print(f"[stop] page={page} status={resp.status_code}")
+            break
+
+        page_rows = extract_page_vacancies(resp.text, page)
+        unique_new = 0
+        for row in page_rows:
+            if row.url in seen_urls:
+                continue
+            seen_urls.add(row.url)
+            all_rows.append(row)
+            unique_new += 1
+
+        print(f"[page {page}] found={len(page_rows)} new={unique_new}")
+
+        if unique_new == 0:
+            empty_streak += 1
+            if empty_streak >= 2:
+                break
+        else:
+            empty_streak = 0
+
+        time.sleep(sleep_seconds)
+
+    return all_rows
+
+
+def write_csv(rows: Iterable[Vacancy], output_path: str) -> None:
+    with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["page", "published_at", "title", "url"]
+        )
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(
+                {
+                    "page": r.page,
+                    "published_at": r.published_at,
+                    "title": r.title,
+                    "url": r.url,
+                }
+            )
+
+
+def maybe_write_excel(csv_path: str, xlsx_path: str) -> None:
+    try:
+        import pandas as pd  # type: ignore
+    except Exception:
+        print("[info] pandas not installed, skipped Excel export.")
+        return
+
+    try:
+        df = pd.read_csv(csv_path)
+        df.to_excel(xlsx_path, index=False)
+        print(f"[ok] Excel saved: {xlsx_path}")
+    except Exception as exc:
+        print(f"[warn] Could not create Excel: {exc}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Scrape all paginated vacancies from edumap.az."
+    )
+    parser.add_argument("--max-pages", type=int, default=500)
+    parser.add_argument("--sleep", type=float, default=0.2)
+    parser.add_argument("--csv", default="edumap_vakansiyalar_all_pages.csv")
+    parser.add_argument("--xlsx", default="edumap_vakansiyalar_all_pages.xlsx")
+    args = parser.parse_args()
+
+    rows = scrape_all_pages(
+        start_page=1,
+        max_pages=args.max_pages,
+        sleep_seconds=args.sleep,
+    )
+    write_csv(rows, args.csv)
+    print(f"[ok] CSV saved: {args.csv}")
+    print(f"[ok] Total rows: {len(rows)}")
+    maybe_write_excel(args.csv, args.xlsx)
+
+
+if __name__ == "__main__":
+    main()
